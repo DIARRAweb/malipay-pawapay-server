@@ -395,10 +395,11 @@ function normalizePawaPayAmount(
   value,
   decimalsInAmount
 ) {
-  let amountText =
+  const amountText =
     cleanText(value, 30)
       .replace(/\s+/g, "")
       .replace(",", ".");
+
 
   if (!amountText) {
     throw new Error(
@@ -406,8 +407,27 @@ function normalizePawaPayAmount(
     );
   }
 
+
+  /*
+  Format strict :
+  - chiffres obligatoires ;
+  - maximum deux chiffres après le point ;
+  - aucune notation scientifique ;
+  - aucun signe négatif.
+  */
+  if (
+    !/^(?:0|[1-9]\d*)(?:\.\d{1,2})?$/
+      .test(amountText)
+  ) {
+    throw new Error(
+      "Le montant doit être un nombre positif avec au maximum deux décimales."
+    );
+  }
+
+
   const amountNumber =
     Number(amountText);
+
 
   if (
     !Number.isFinite(amountNumber) ||
@@ -418,27 +438,30 @@ function normalizePawaPayAmount(
     );
   }
 
+
   if (
-    decimalsInAmount === "NONE" &&
-    !Number.isInteger(amountNumber)
+    decimalsInAmount === "NONE"
   ) {
-    throw new Error(
-      "Cet opérateur n’accepte pas les montants avec décimales."
-    );
+    if (
+      !Number.isInteger(amountNumber)
+    ) {
+      throw new Error(
+        "Cet opérateur n’accepte pas les montants avec décimales."
+      );
+    }
+
+
+    return String(amountNumber);
   }
+
 
   /*
-  On évite les notations scientifiques
-  et les zéros inutiles à la fin.
+  Pour TWO_PLACES :
+  on conserve au maximum deux décimales,
+  sans ajouter de troisième décimale.
   */
-  if (decimalsInAmount === "NONE") {
-    return String(
-      Math.trunc(amountNumber)
-    );
-  }
-
   return amountNumber
-    .toFixed(3)
+    .toFixed(2)
     .replace(/0+$/, "")
     .replace(/\.$/, "");
 }
