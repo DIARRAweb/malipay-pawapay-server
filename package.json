@@ -1,0 +1,17 @@
+{
+  "name": "malipay-pawapay-server",
+  "version": "1.0.0",
+  "description": "Serveur pawaPay de MaliPay",
+  "type": "module",
+  "main": "malipay-pawapay-server.js",
+  "scripts": {
+    "start": "node malipay-pawapay-server.js"
+  },
+  "dependencies": {
+    "axios": "^1.11.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.1",
+    "express": "^5.1.0",
+    "uuid": "^11.1.0"
+  }
+}
