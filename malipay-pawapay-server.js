@@ -3,8 +3,89 @@ import cors from "cors";
 import dotenv from "dotenv";
 import crypto from "node:crypto";
 
+import {
+  initializeApp,
+  cert,
+  getApps
+} from "firebase-admin/app";
+
+import {
+  getDatabase
+} from "firebase-admin/database";
+
 
 dotenv.config();
+
+/* =========================================================
+   🔥 FIREBASE ADMIN
+========================================================= */
+
+const FIREBASE_DATABASE_URL =
+  String(
+    process.env.FIREBASE_DATABASE_URL || ""
+  ).trim();
+
+const FIREBASE_SERVICE_ACCOUNT_JSON =
+  String(
+    process.env.FIREBASE_SERVICE_ACCOUNT_JSON || ""
+  ).trim();
+
+function initializeFirebaseAdmin() {
+  if (getApps().length > 0) {
+    return getApps()[0];
+  }
+
+  if (!FIREBASE_DATABASE_URL) {
+    throw new Error(
+      "La variable FIREBASE_DATABASE_URL est absente."
+    );
+  }
+
+  if (!FIREBASE_SERVICE_ACCOUNT_JSON) {
+    throw new Error(
+      "La variable FIREBASE_SERVICE_ACCOUNT_JSON est absente."
+    );
+  }
+
+  let serviceAccount;
+
+  try {
+    serviceAccount =
+      JSON.parse(
+        FIREBASE_SERVICE_ACCOUNT_JSON
+      );
+  } catch (error) {
+    throw new Error(
+      "FIREBASE_SERVICE_ACCOUNT_JSON ne contient pas un JSON valide."
+    );
+  }
+
+  /*
+  Sur Render, les retours à la ligne de private_key
+  peuvent avoir été transformés en caractères \\n.
+  */
+  if (serviceAccount.private_key) {
+    serviceAccount.private_key =
+      serviceAccount.private_key.replace(
+        /\\n/g,
+        "\n"
+      );
+  }
+
+  return initializeApp({
+    credential:
+      cert(serviceAccount),
+
+    databaseURL:
+      FIREBASE_DATABASE_URL
+  });
+}
+
+const firebaseAdminApp =
+  initializeFirebaseAdmin();
+
+const adminDb =
+  getDatabase(firebaseAdminApp);
 
 
 /* =========================================================
@@ -579,6 +660,798 @@ function findDepositConfiguration({
 
 
 /* =========================================================
+   🔐 ENREGISTREMENT ET CRÉDIT PAWAPAY CÔTÉ SERVEUR
+========================================================= */
+
+function normalizeMaliPayUserPhone(value) {
+  let phone =
+    cleanText(value, 40)
+      .replace(/\s+/g, "")
+      .replace(/[^\d+]/g, "");
+
+  if (phone.startsWith("00")) {
+    phone =
+      "+" + phone.slice(2);
+  }
+
+  if (!phone.startsWith("+")) {
+    phone =
+      "+" + phone.replace(/\D/g, "");
+  }
+
+  return phone;
+}
+
+function getObjectPathValue(
+  root,
+  pathParts
+) {
+  let current = root;
+
+  for (const part of pathParts) {
+    if (
+      !current ||
+      typeof current !== "object"
+    ) {
+      return undefined;
+    }
+
+    current = current[part];
+  }
+
+  return current;
+}
+
+function ensureObjectPath(
+  root,
+  pathParts
+) {
+  let current = root;
+
+  for (const part of pathParts) {
+    if (
+      !current[part] ||
+      typeof current[part] !== "object"
+    ) {
+      current[part] = {};
+    }
+
+    current = current[part];
+  }
+
+  return current;
+}
+
+function getMaliPayUserCurrency(
+  rootData,
+  userPhone
+) {
+  const currencies =
+    rootData?.currencies &&
+    typeof rootData.currencies === "object"
+      ? rootData.currencies
+      : {};
+
+  const prefixes =
+    Object.keys(currencies)
+      .sort(
+        (a, b) =>
+          b.length - a.length
+      );
+
+  for (const prefix of prefixes) {
+    if (
+      String(userPhone || "")
+        .startsWith(prefix)
+    ) {
+      return (
+        currencies[prefix]?.code ||
+        "XOF"
+      );
+    }
+  }
+
+  return "XOF";
+}
+
+async function savePawaPayDepositMapping({
+  depositId,
+  userPhone,
+  customID,
+  provider,
+  currency,
+  phoneNumber,
+  amount,
+  country,
+  customerMessage,
+  status
+}) {
+  if (!depositId || !userPhone) {
+    throw new Error(
+      "Impossible d’enregistrer la correspondance du dépôt."
+    );
+  }
+
+  const mappingRef =
+    adminDb.ref(
+      `pawaPayDeposits/${depositId}`
+    );
+
+  const existingSnapshot =
+    await mappingRef.get();
+
+  if (existingSnapshot.exists()) {
+    const existing =
+      existingSnapshot.val() || {};
+
+    if (
+      existing.userPhone &&
+      existing.userPhone !== userPhone
+    ) {
+      throw new Error(
+        "Ce depositId appartient déjà à un autre compte."
+      );
+    }
+  }
+
+  await mappingRef.update({
+    depositId,
+    userPhone,
+    customID:
+      customID || "",
+
+    provider:
+      provider || "",
+
+    currency:
+      currency || "",
+
+    paymentPhone:
+      phoneNumber || "",
+
+    amount:
+      String(amount || ""),
+
+    country:
+      country || "",
+
+    customerMessage:
+      customerMessage || "",
+
+    status:
+      status || "ACCEPTED",
+
+    final:
+      false,
+
+    successful:
+      false,
+
+    balanceCredited:
+      false,
+
+    createdAt:
+      existingSnapshot.exists()
+        ? existingSnapshot.val()
+            ?.createdAt ||
+          Date.now()
+        : Date.now(),
+
+    updatedAt:
+      Date.now()
+  });
+}
+
+async function creditCompletedPawaPayDeposit(
+  verifiedDeposit
+) {
+  const depositId =
+    cleanText(
+      verifiedDeposit?.depositId,
+      50
+    );
+
+  const status =
+    cleanText(
+      verifiedDeposit?.status,
+      30
+    ).toUpperCase();
+
+  if (!isValidUuidV4(depositId)) {
+    throw new Error(
+      "Deposit ID invalide."
+    );
+  }
+
+  if (status !== "COMPLETED") {
+    return {
+      credited: false,
+      alreadyCredited: false,
+      reason:
+        "Le dépôt n’est pas COMPLETED."
+    };
+  }
+
+  const mappingSnapshot =
+    await adminDb
+      .ref(
+        `pawaPayDeposits/${depositId}`
+      )
+      .get();
+
+  if (!mappingSnapshot.exists()) {
+    throw new Error(
+      "Ce dépôt n’est pas enregistré dans MaliPay."
+    );
+  }
+
+  const mapping =
+    mappingSnapshot.val() || {};
+
+  const userPhone =
+    normalizeMaliPayUserPhone(
+      mapping.userPhone
+    );
+
+  if (!userPhone) {
+    throw new Error(
+      "Le compte MaliPay associé est invalide."
+    );
+  }
+
+  const verifiedAmount =
+    Number(
+      verifiedDeposit?.amount
+    );
+
+  const registeredAmount =
+    Number(
+      mapping.amount
+    );
+
+  const verifiedCurrency =
+    normalizeCurrency(
+      verifiedDeposit?.currency
+    );
+
+  const registeredCurrency =
+    normalizeCurrency(
+      mapping.currency
+    );
+
+  if (
+    !Number.isFinite(verifiedAmount) ||
+    verifiedAmount <= 0
+  ) {
+    throw new Error(
+      "Le montant confirmé par pawaPay est invalide."
+    );
+  }
+
+  if (
+    !Number.isFinite(registeredAmount) ||
+    registeredAmount <= 0
+  ) {
+    throw new Error(
+      "Le montant enregistré dans MaliPay est invalide."
+    );
+  }
+
+  if (
+    Math.abs(
+      verifiedAmount -
+      registeredAmount
+    ) > 0.000001
+  ) {
+    throw new Error(
+      "Le montant confirmé par pawaPay ne correspond pas au montant enregistré."
+    );
+  }
+
+  if (
+    !verifiedCurrency ||
+    verifiedCurrency !==
+      registeredCurrency
+  ) {
+    throw new Error(
+      "La devise confirmée par pawaPay ne correspond pas à la devise enregistrée."
+    );
+  }
+
+  const historyKey =
+    adminDb
+      .ref(
+        `history/${userPhone}`
+      )
+      .push()
+      .key;
+
+  const notificationKey =
+    adminDb
+      .ref(
+        `notifications/${userPhone}`
+      )
+      .push()
+      .key;
+
+  let transactionResultType =
+    "unknown";
+
+  const rootRef =
+    adminDb.ref("/");
+
+  const transactionResult =
+    await rootRef.transaction(
+      rootData => {
+        if (
+          !rootData ||
+          typeof rootData !== "object"
+        ) {
+          rootData = {};
+        }
+
+        const deposits =
+          ensureObjectPath(
+            rootData,
+            ["pawaPayDeposits"]
+          );
+
+        const depositRecord =
+          deposits[depositId];
+
+        if (!depositRecord) {
+          transactionResultType =
+            "mapping_not_found";
+
+          return;
+        }
+
+        if (
+          depositRecord.userPhone !==
+          userPhone
+        ) {
+          transactionResultType =
+            "owner_mismatch";
+
+          return;
+        }
+
+        if (
+          depositRecord
+            .balanceCredited === true
+        ) {
+          transactionResultType =
+            "already_credited";
+
+          return rootData;
+        }
+
+        const users =
+          ensureObjectPath(
+            rootData,
+            ["users"]
+          );
+
+        const user =
+          users[userPhone];
+
+        if (!user) {
+          transactionResultType =
+            "user_not_found";
+
+          return;
+        }
+
+        if (user.frozen === true) {
+          transactionResultType =
+            "user_frozen";
+
+          return;
+        }
+
+        const userCurrency =
+          getMaliPayUserCurrency(
+            rootData,
+            userPhone
+          );
+
+        if (
+          userCurrency !==
+          verifiedCurrency
+        ) {
+          transactionResultType =
+            "currency_mismatch";
+
+          return;
+        }
+
+        const currentBalance =
+          Number(
+            user.solde || 0
+          );
+
+        if (
+          !Number.isFinite(
+            currentBalance
+          )
+        ) {
+          transactionResultType =
+            "invalid_balance";
+
+          return;
+        }
+
+        const creditedAt =
+          Date.now();
+
+        users[userPhone] = {
+          ...user,
+
+          solde:
+            currentBalance +
+            verifiedAmount
+        };
+
+        deposits[depositId] = {
+          ...depositRecord,
+
+          status:
+            "COMPLETED",
+
+          final:
+            true,
+
+          successful:
+            true,
+
+          balanceCredited:
+            true,
+
+          creditedAmount:
+            verifiedAmount,
+
+          creditedCurrency:
+            verifiedCurrency,
+
+          creditedAt,
+
+          updatedAt:
+            creditedAt
+        };
+
+        const userTopupRequests =
+          ensureObjectPath(
+            rootData,
+            [
+              "topupRequests",
+              userPhone
+            ]
+          );
+
+        const existingTopupRequest =
+          userTopupRequests[
+            depositId
+          ] || {};
+
+        userTopupRequests[
+          depositId
+        ] = {
+          ...existingTopupRequest,
+
+          customID:
+            mapping.customID || "",
+
+          depositId,
+
+          userPhone,
+
+          userName:
+            user.name || "",
+
+          country:
+            mapping.country || "",
+
+          provider:
+            mapping.provider || "",
+
+          currency:
+            verifiedCurrency,
+
+          paymentPhone:
+            mapping.paymentPhone || "",
+
+          amount:
+            String(
+              verifiedAmount
+            ),
+
+          customerMessage:
+            mapping.customerMessage ||
+            "",
+
+          status:
+            "COMPLETED",
+
+          accepted:
+            true,
+
+          final:
+            true,
+
+          successful:
+            true,
+
+          balanceCredited:
+            true,
+
+          creditedAmount:
+            verifiedAmount,
+
+          providerName:
+            "pawaPay",
+
+          completedAt:
+            creditedAt,
+
+          creditedAt,
+
+          updatedAt:
+            creditedAt
+        };
+
+        if (historyKey) {
+          const userHistory =
+            ensureObjectPath(
+              rootData,
+              [
+                "history",
+                userPhone
+              ]
+            );
+
+          userHistory[
+            historyKey
+          ] = {
+            customID:
+              mapping.customID ||
+              `PAWAPAY-${depositId}`,
+
+            type:
+              "pawapay_topup",
+
+            provider:
+              "pawaPay",
+
+            depositId,
+
+            from:
+              mapping.paymentPhone ||
+              "pawaPay",
+
+            to:
+              userPhone,
+
+            amountOriginal:
+              verifiedAmount,
+
+            amountConverted:
+              verifiedAmount,
+
+            currency:
+              verifiedCurrency,
+
+            serviceFee:
+              0,
+
+            startupFee:
+              0,
+
+            totalFees:
+              0,
+
+            rateUsed:
+              "Recharge pawaPay",
+
+            reason:
+              "Recharge Mobile Money confirmée",
+
+            status:
+              "COMPLETED",
+
+            date:
+              new Date(
+                creditedAt
+              ).toLocaleString(
+                "fr-FR"
+              ),
+
+            createdAt:
+              creditedAt
+          };
+        }
+
+        if (notificationKey) {
+          const userNotifications =
+            ensureObjectPath(
+              rootData,
+              [
+                "notifications",
+                userPhone
+              ]
+            );
+
+          userNotifications[
+            notificationKey
+          ] = {
+            title:
+              "✅ Solde MALIPAY crédité",
+
+            phone:
+              mapping.paymentPhone ||
+              userPhone,
+
+            amount:
+              verifiedAmount,
+
+            currency:
+              verifiedCurrency,
+
+            symbol:
+              verifiedCurrency,
+
+            reason:
+              "Recharge confirmée par pawaPay",
+
+            depositId,
+
+            status:
+              "COMPLETED",
+
+            date:
+              new Date(
+                creditedAt
+              ).toLocaleString(
+                "fr-FR"
+              ),
+
+            createdAt:
+              creditedAt,
+
+            seen:
+              false,
+
+            claimable:
+              false
+          };
+        }
+
+        transactionResultType =
+          "credited";
+
+        return rootData;
+      },
+      undefined,
+      false
+    );
+
+  if (
+    transactionResultType ===
+    "already_credited"
+  ) {
+    return {
+      credited: false,
+      alreadyCredited: true,
+      depositId,
+      userPhone
+    };
+  }
+
+  if (
+    !transactionResult.committed ||
+    transactionResultType !==
+      "credited"
+  ) {
+    const errorMessages = {
+      mapping_not_found:
+        "Le dépôt n’est plus enregistré.",
+
+      owner_mismatch:
+        "Le propriétaire du dépôt ne correspond pas.",
+
+      user_not_found:
+        "Le compte MaliPay est introuvable.",
+
+      user_frozen:
+        "Le compte MaliPay est gelé.",
+
+      currency_mismatch:
+        "La devise du dépôt ne correspond pas à celle du compte MaliPay.",
+
+      invalid_balance:
+        "Le solde actuel du compte est invalide."
+    };
+
+    throw new Error(
+      errorMessages[
+        transactionResultType
+      ] ||
+      "Le crédit automatique Firebase a été refusé."
+    );
+  }
+
+  return {
+    credited: true,
+    alreadyCredited: false,
+    depositId,
+    userPhone,
+    amount:
+      verifiedAmount,
+    currency:
+      verifiedCurrency
+  };
+}
+
+async function verifyAndCreditPawaPayDeposit(
+  depositId
+) {
+  const pawaPayResponse =
+    await callPawaPay(
+      `/v2/deposits/${encodeURIComponent(
+        depositId
+      )}`,
+      {
+        method: "GET"
+      }
+    );
+
+  const found =
+    pawaPayResponse?.status ===
+    "FOUND";
+
+  if (!found) {
+    return {
+      found: false,
+      status:
+        "NOT_FOUND",
+      credited:
+        false,
+      alreadyCredited:
+        false,
+      data:
+        null
+    };
+  }
+
+  const depositData =
+    pawaPayResponse?.data || {};
+
+  const status =
+    depositData.status ||
+    "UNKNOWN";
+
+  let creditResult = {
+    credited: false,
+    alreadyCredited: false
+  };
+
+  if (status === "COMPLETED") {
+    creditResult =
+      await creditCompletedPawaPayDeposit(
+        depositData
+      );
+  }
+
+  return {
+    found: true,
+    status,
+    data:
+      depositData,
+    ...creditResult
+  };
+}
+
+
+/* =========================================================
    💰 CRÉATION D’UNE RECHARGE PAWAPAY
 ========================================================= */
 
@@ -625,6 +1498,23 @@ app.post(
         normalizeCustomerMessage(
           req.body?.customerMessage
         );
+
+      const userPhone =
+        normalizeMaliPayUserPhone(
+          req.body?.userPhone
+        );
+
+      if (
+        !userPhone ||
+        userPhone.length < 8
+      ) {
+        return res.status(400).json({
+          ok: false,
+
+          error:
+            "Le compte MaliPay associé à la recharge est invalide."
+        });
+      }
 
       if (!provider) {
         return res.status(400).json({
@@ -800,6 +1690,25 @@ app.post(
         pawaPayResponse?.status ===
           "DUPLICATE_IGNORED";
 
+      if (accepted) {
+        await savePawaPayDepositMapping({
+          depositId,
+          userPhone,
+          customID:
+            clientReferenceId,
+          provider,
+          currency,
+          phoneNumber,
+          amount,
+          country:
+            activeConfig.country,
+          customerMessage,
+          status:
+            pawaPayResponse?.status ||
+            "ACCEPTED"
+        });
+      }
+
       return res.status(200).json({
         ok: accepted,
 
@@ -813,6 +1722,8 @@ app.post(
             : "La demande de recharge a été refusée par pawaPay.",
 
         depositId,
+
+        userPhone,
 
         provider,
 
@@ -878,7 +1789,7 @@ app.post(
 
 
 /* =========================================================
-   🔍 VÉRIFICATION DU STATUT D’UNE RECHARGE
+   🔍 VÉRIFICATION DU STATUT ET CRÉDIT SERVEUR
 ========================================================= */
 
 app.get(
@@ -902,58 +1813,54 @@ app.get(
         });
       }
 
-      const pawaPayResponse =
-        await callPawaPay(
-          `/v2/deposits/${encodeURIComponent(
-            depositId
-          )}`,
-          {
-            method: "GET"
-          }
+      const result =
+        await verifyAndCreditPawaPayDeposit(
+          depositId
         );
 
-      const found =
-        pawaPayResponse?.status ===
-        "FOUND";
-
-      const paymentStatus =
-        found
-          ? pawaPayResponse
-              ?.data
-              ?.status ||
-            "UNKNOWN"
-          : "NOT_FOUND";
-
       const final =
-        paymentStatus ===
+        result.status ===
           "COMPLETED" ||
-        paymentStatus ===
+        result.status ===
           "FAILED";
 
       return res.status(200).json({
         ok: true,
 
-        found,
+        found:
+          result.found,
 
         final,
 
         successful:
-          paymentStatus ===
+          result.status ===
           "COMPLETED",
 
         depositId,
 
         status:
-          paymentStatus,
+          result.status,
+
+        balanceCredited:
+          result.credited === true ||
+          result.alreadyCredited ===
+            true,
+
+        creditedNow:
+          result.credited === true,
+
+        alreadyCredited:
+          result.alreadyCredited ===
+            true,
 
         data:
-          pawaPayResponse?.data ||
+          result.data ||
           null
       });
 
     } catch (error) {
       console.error(
-        "❌ Erreur statut recharge pawaPay :",
+        "❌ Erreur statut/crédit pawaPay :",
         {
           message:
             error?.message,
@@ -976,7 +1883,7 @@ app.get(
 
           error:
             error?.message ||
-            "Impossible de vérifier la recharge.",
+            "Impossible de vérifier ou créditer la recharge.",
 
           details:
             error?.pawaPayResponse ||
@@ -986,40 +1893,32 @@ app.get(
   }
 );
 
-
 /* =========================================================
    📥 CALLBACK DE RECHARGE PAWAPAY
 ========================================================= */
 
 app.post(
   "/pawapay/deposit-callback",
-  (req, res) => {
+  async (req, res) => {
     const callback =
       req.body &&
       typeof req.body === "object"
         ? req.body
         : {};
 
+    const depositId =
+      cleanText(
+        callback.depositId,
+        50
+      );
+
     console.log(
-      "📥 Callback recharge pawaPay :",
+      "📥 Callback recharge pawaPay reçu :",
       {
-        depositId:
-          callback.depositId,
+        depositId,
 
-        status:
+        callbackStatus:
           callback.status,
-
-        amount:
-          callback.amount,
-
-        currency:
-          callback.currency,
-
-        provider:
-          callback
-            ?.payer
-            ?.accountDetails
-            ?.provider,
 
         receivedAt:
           new Date()
@@ -1027,23 +1926,106 @@ app.post(
       }
     );
 
-    /*
-    Important :
-    nous accusons réception du callback.
+    if (
+      !isValidUuidV4(depositId)
+    ) {
+      return res.status(400).json({
+        ok: false,
 
-    À cette étape, ce serveur ne crédite encore aucun
-    compte MaliPay. Cette partie sera ajoutée ensuite
-    avec une vérification Firebase et une protection
-    contre le double crédit.
-    */
-    return res.status(200).json({
-      ok: true,
+        error:
+          "Deposit ID invalide."
+      });
+    }
 
-      received: true
-    });
+    try {
+      /*
+      Ne jamais créditer directement avec les données
+      envoyées dans le callback.
+
+      Le serveur interroge lui-même pawaPay afin de
+      confirmer le statut, le montant et la devise.
+      */
+      const result =
+        await verifyAndCreditPawaPayDeposit(
+          depositId
+        );
+
+      console.log(
+        "✅ Callback pawaPay traité :",
+        {
+          depositId,
+
+          status:
+            result.status,
+
+          credited:
+            result.credited,
+
+          alreadyCredited:
+            result.alreadyCredited
+        }
+      );
+
+      return res.status(200).json({
+        ok: true,
+
+        received: true,
+
+        verified:
+          result.found === true,
+
+        status:
+          result.status,
+
+        balanceCredited:
+          result.credited === true ||
+          result.alreadyCredited ===
+            true,
+
+        creditedNow:
+          result.credited === true,
+
+        alreadyCredited:
+          result.alreadyCredited ===
+            true
+      });
+
+    } catch (error) {
+      console.error(
+        "❌ Erreur traitement callback pawaPay :",
+        {
+          depositId,
+
+          message:
+            error?.message,
+
+          status:
+            error?.status,
+
+          details:
+            error?.pawaPayResponse
+        }
+      );
+
+      /*
+      Une erreur 500 permet au fournisseur de considérer
+      que le callback n’a pas été correctement traité.
+      */
+      return res.status(500).json({
+        ok: false,
+
+        received: true,
+
+        balanceCredited:
+          false,
+
+        error:
+          error?.message ||
+          "Le callback n’a pas pu être traité."
+      });
+    }
   }
 );
-
 
 /* =========================================================
    📤 CALLBACK DE RETRAIT / PAYOUT
