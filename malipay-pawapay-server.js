@@ -872,12 +872,17 @@ async function creditCompletedPawaPayDeposit(
     };
   }
 
+  /* =====================================================
+     1. RÉCUPÉRER LE MAPPING MALIPAY DU DÉPÔT
+  ===================================================== */
+
+  const mappingRef =
+    adminDb.ref(
+      `pawaPayDeposits/${depositId}`
+    );
+
   const mappingSnapshot =
-    await adminDb
-      .ref(
-        `pawaPayDeposits/${depositId}`
-      )
-      .get();
+    await mappingRef.get();
 
   if (!mappingSnapshot.exists()) {
     throw new Error(
@@ -898,6 +903,10 @@ async function creditCompletedPawaPayDeposit(
       "Le compte MaliPay associé est invalide."
     );
   }
+
+  /* =====================================================
+     2. VÉRIFIER LE MONTANT ET LA DEVISE
+  ===================================================== */
 
   const verifiedAmount =
     Number(
@@ -958,116 +967,108 @@ async function creditCompletedPawaPayDeposit(
     );
   }
 
-  const historyKey =
-    adminDb
-      .ref(
-        `history/${userPhone}`
-      )
-      .push()
-      .key;
+  /* =====================================================
+     3. VÉRIFIER LA DEVISE DU COMPTE MALIPAY
+  ===================================================== */
 
-  const notificationKey =
-    adminDb
-      .ref(
-        `notifications/${userPhone}`
-      )
-      .push()
-      .key;
+  const currenciesSnapshot =
+    await adminDb
+      .ref("currencies")
+      .get();
+
+  const userCurrency =
+    getMaliPayUserCurrency(
+      {
+        currencies:
+          currenciesSnapshot.exists()
+            ? currenciesSnapshot.val()
+            : {}
+      },
+      userPhone
+    );
+
+  if (
+    userCurrency !==
+    verifiedCurrency
+  ) {
+    throw new Error(
+      "La devise du dépôt ne correspond pas à celle du compte MaliPay."
+    );
+  }
+
+  /*
+  Clé Firebase sécurisée et déterministe.
+
+  Elle permet d’enregistrer le Deposit ID directement
+  dans le compte utilisateur et d’empêcher définitivement
+  un deuxième crédit.
+  */
+  const safeDepositKey =
+    depositId.replace(
+      /[.#$\[\]\/]/g,
+      "_"
+    );
+
+  const userRef =
+    adminDb.ref(
+      `users/${userPhone}`
+    );
 
   let transactionResultType =
     "unknown";
 
-  const rootRef =
-    adminDb.ref("/");
+  /* =====================================================
+     4. TRANSACTION UNIQUEMENT SUR LE COMPTE UTILISATEUR
+  ===================================================== */
 
-  const transactionResult =
-    await rootRef.transaction(
-      rootData => {
+  const userTransaction =
+    await userRef.transaction(
+      userData => {
         if (
-          !rootData ||
-          typeof rootData !== "object"
+          !userData ||
+          typeof userData !== "object"
         ) {
-          rootData = {};
-        }
-
-        const deposits =
-          ensureObjectPath(
-            rootData,
-            ["pawaPayDeposits"]
-          );
-
-        const depositRecord =
-          deposits[depositId];
-
-        if (!depositRecord) {
-          transactionResultType =
-            "mapping_not_found";
-
-          return;
-        }
-
-        if (
-          depositRecord.userPhone !==
-          userPhone
-        ) {
-          transactionResultType =
-            "owner_mismatch";
-
-          return;
-        }
-
-        if (
-          depositRecord
-            .balanceCredited === true
-        ) {
-          transactionResultType =
-            "already_credited";
-
-          return rootData;
-        }
-
-        const users =
-          ensureObjectPath(
-            rootData,
-            ["users"]
-          );
-
-        const user =
-          users[userPhone];
-
-        if (!user) {
           transactionResultType =
             "user_not_found";
 
           return;
         }
 
-        if (user.frozen === true) {
+        if (userData.frozen === true) {
           transactionResultType =
             "user_frozen";
 
           return;
         }
 
-        const userCurrency =
-          getMaliPayUserCurrency(
-            rootData,
-            userPhone
-          );
-
         if (
-          userCurrency !==
-          verifiedCurrency
+          !userData.pawapayCredits ||
+          typeof userData.pawapayCredits !==
+            "object"
+        ) {
+          userData.pawapayCredits = {};
+        }
+
+        /*
+        Protection contre le double crédit.
+
+        Si ce Deposit ID est déjà présent dans le compte,
+        aucun montant n’est ajouté une deuxième fois.
+        */
+        if (
+          userData
+            .pawapayCredits
+            [safeDepositKey]
         ) {
           transactionResultType =
-            "currency_mismatch";
+            "already_credited";
 
-          return;
+          return userData;
         }
 
         const currentBalance =
           Number(
-            user.solde || 0
+            userData.solde || 0
           );
 
         if (
@@ -1084,288 +1085,96 @@ async function creditCompletedPawaPayDeposit(
         const creditedAt =
           Date.now();
 
-        users[userPhone] = {
-          ...user,
+        const newBalance =
+          currentBalance +
+          verifiedAmount;
 
-          solde:
-            currentBalance +
-            verifiedAmount
-        };
+        userData.solde =
+          newBalance;
 
-        deposits[depositId] = {
-          ...depositRecord,
-
-          status:
-            "COMPLETED",
-
-          final:
-            true,
-
-          successful:
-            true,
-
-          balanceCredited:
-            true,
-
-          creditedAmount:
-            verifiedAmount,
-
-          creditedCurrency:
-            verifiedCurrency,
-
-          creditedAt,
-
-          updatedAt:
-            creditedAt
-        };
-
-        const userTopupRequests =
-          ensureObjectPath(
-            rootData,
-            [
-              "topupRequests",
-              userPhone
-            ]
-          );
-
-        const existingTopupRequest =
-          userTopupRequests[
-            depositId
-          ] || {};
-
-        userTopupRequests[
-          depositId
-        ] = {
-          ...existingTopupRequest,
-
-          customID:
-            mapping.customID || "",
-
-          depositId,
-
-          userPhone,
-
-          userName:
-            user.name || "",
-
-          country:
-            mapping.country || "",
-
-          provider:
-            mapping.provider || "",
-
-          currency:
-            verifiedCurrency,
-
-          paymentPhone:
-            mapping.paymentPhone || "",
-
-          amount:
-            String(
-              verifiedAmount
-            ),
-
-          customerMessage:
-            mapping.customerMessage ||
-            "",
-
-          status:
-            "COMPLETED",
-
-          accepted:
-            true,
-
-          final:
-            true,
-
-          successful:
-            true,
-
-          balanceCredited:
-            true,
-
-          creditedAmount:
-            verifiedAmount,
-
-          providerName:
-            "pawaPay",
-
-          completedAt:
-            creditedAt,
-
-          creditedAt,
-
-          updatedAt:
-            creditedAt
-        };
-
-        if (historyKey) {
-          const userHistory =
-            ensureObjectPath(
-              rootData,
-              [
-                "history",
-                userPhone
-              ]
-            );
-
-          userHistory[
-            historyKey
-          ] = {
-            customID:
-              mapping.customID ||
-              `PAWAPAY-${depositId}`,
-
-            type:
-              "pawapay_topup",
-
-            provider:
-              "pawaPay",
-
+        userData
+          .pawapayCredits
+          [safeDepositKey] = {
             depositId,
 
-            from:
-              mapping.paymentPhone ||
-              "pawaPay",
-
-            to:
-              userPhone,
-
-            amountOriginal:
+            creditedAmount:
               verifiedAmount,
 
-            amountConverted:
+            originalAmount:
               verifiedAmount,
 
-            currency:
+            paymentCurrency:
               verifiedCurrency,
 
-            serviceFee:
-              0,
+            walletCurrency:
+              userCurrency,
 
-            startupFee:
-              0,
+            conversionRate:
+              1,
 
-            totalFees:
-              0,
+            balanceBefore:
+              currentBalance,
 
-            rateUsed:
-              "Recharge pawaPay",
+            balanceAfter:
+              newBalance,
 
-            reason:
-              "Recharge Mobile Money confirmée",
-
-            status:
-              "COMPLETED",
-
-            date:
-              new Date(
-                creditedAt
-              ).toLocaleString(
-                "fr-FR"
-              ),
-
-            createdAt:
-              creditedAt
+            creditedAt
           };
-        }
-
-        if (notificationKey) {
-          const userNotifications =
-            ensureObjectPath(
-              rootData,
-              [
-                "notifications",
-                userPhone
-              ]
-            );
-
-          userNotifications[
-            notificationKey
-          ] = {
-            title:
-              "✅ Solde MALIPAY crédité",
-
-            phone:
-              mapping.paymentPhone ||
-              userPhone,
-
-            amount:
-              verifiedAmount,
-
-            currency:
-              verifiedCurrency,
-
-            symbol:
-              verifiedCurrency,
-
-            reason:
-              "Recharge confirmée par pawaPay",
-
-            depositId,
-
-            status:
-              "COMPLETED",
-
-            date:
-              new Date(
-                creditedAt
-              ).toLocaleString(
-                "fr-FR"
-              ),
-
-            createdAt:
-              creditedAt,
-
-            seen:
-              false,
-
-            claimable:
-              false
-          };
-        }
 
         transactionResultType =
           "credited";
 
-        return rootData;
+        return userData;
       },
       undefined,
       false
     );
 
-  if (
-    transactionResultType ===
-    "already_credited"
-  ) {
-    return {
-      credited: false,
-      alreadyCredited: true,
-      depositId,
-      userPhone
-    };
+  /* =====================================================
+     5. RELIRE LE COMPTE APRÈS LA TRANSACTION
+  ===================================================== */
+
+  const freshUserSnapshot =
+    await userRef.get();
+
+  if (!freshUserSnapshot.exists()) {
+    throw new Error(
+      "Le compte MaliPay est introuvable après la transaction."
+    );
   }
 
+  const freshUser =
+    freshUserSnapshot.val() || {};
+
+  const creditInformation =
+    freshUser
+      ?.pawapayCredits
+      ?.[safeDepositKey];
+
+  /*
+  Si le Deposit ID est déjà présent, cela signifie
+  qu’un callback ou une vérification précédente
+  avait déjà crédité ce dépôt.
+  */
+  const alreadyCredited =
+    transactionResultType ===
+      "already_credited";
+
+  const creditedNow =
+    transactionResultType ===
+      "credited" &&
+    userTransaction.committed === true;
+
   if (
-    !transactionResult.committed ||
-    transactionResultType !==
-      "credited"
+    !creditInformation &&
+    !creditedNow
   ) {
     const errorMessages = {
-      mapping_not_found:
-        "Le dépôt n’est plus enregistré.",
-
-      owner_mismatch:
-        "Le propriétaire du dépôt ne correspond pas.",
-
       user_not_found:
         "Le compte MaliPay est introuvable.",
 
       user_frozen:
         "Le compte MaliPay est gelé.",
-
-      currency_mismatch:
-        "La devise du dépôt ne correspond pas à celle du compte MaliPay.",
 
       invalid_balance:
         "Le solde actuel du compte est invalide."
@@ -1379,15 +1188,344 @@ async function creditCompletedPawaPayDeposit(
     );
   }
 
-  return {
-    credited: true,
-    alreadyCredited: false,
+  const creditedAmount =
+    Number(
+      creditInformation
+        ?.creditedAmount ||
+      verifiedAmount
+    );
+
+  const balanceBefore =
+    Number(
+      creditInformation
+        ?.balanceBefore || 0
+    );
+
+  const balanceAfter =
+    Number(
+      creditInformation
+        ?.balanceAfter ||
+      freshUser.solde ||
+      0
+    );
+
+  const creditedAt =
+    Number(
+      creditInformation
+        ?.creditedAt ||
+      Date.now()
+    );
+
+  /* =====================================================
+     6. RÉCUPÉRER L’ANCIENNE DEMANDE TOPUP
+  ===================================================== */
+
+  const topupRequestRef =
+    adminDb.ref(
+      `topupRequests/${userPhone}/${depositId}`
+    );
+
+  const topupRequestSnapshot =
+    await topupRequestRef.get();
+
+  const existingTopupRequest =
+    topupRequestSnapshot.exists()
+      ? topupRequestSnapshot.val() || {}
+      : {};
+
+  /*
+  Identifiants déterministes.
+
+  Le même Deposit ID écrase toujours le même historique
+  et la même notification au lieu de créer des doublons.
+  */
+  const historyId =
+    `pawapay_${safeDepositKey}`;
+
+  const notificationId =
+    `pawapay_${safeDepositKey}`;
+
+  /* =====================================================
+     7. SYNCHRONISATION MULTI-CHEMINS FIREBASE
+  ===================================================== */
+
+  const updates = {};
+
+  updates[
+    `pawaPayDeposits/${depositId}`
+  ] = {
+    ...mapping,
+
     depositId,
+
     userPhone,
-    amount:
-      verifiedAmount,
+
+    status:
+      "COMPLETED",
+
+    final:
+      true,
+
+    successful:
+      true,
+
+    balanceCredited:
+      true,
+
+    creditedAmount,
+
+    creditedCurrency:
+      verifiedCurrency,
+
+    balanceBeforeCredit:
+      balanceBefore,
+
+    balanceAfterCredit:
+      balanceAfter,
+
+    creditedAt,
+
+    updatedAt:
+      Date.now()
+  };
+
+  updates[
+    `topupRequests/${userPhone}/${depositId}`
+  ] = {
+    ...existingTopupRequest,
+
+    customID:
+      mapping.customID || "",
+
+    depositId,
+
+    userPhone,
+
+    userName:
+      freshUser.name || "",
+
+    country:
+      mapping.country || "",
+
+    provider:
+      mapping.provider || "",
+
     currency:
-      verifiedCurrency
+      verifiedCurrency,
+
+    paymentPhone:
+      mapping.paymentPhone || "",
+
+    amount:
+      String(
+        verifiedAmount
+      ),
+
+    customerMessage:
+      mapping.customerMessage || "",
+
+    status:
+      "COMPLETED",
+
+    accepted:
+      true,
+
+    final:
+      true,
+
+    successful:
+      true,
+
+    balanceCredited:
+      true,
+
+    creditedAmount,
+
+    originalPaidAmount:
+      verifiedAmount,
+
+    paymentCurrency:
+      verifiedCurrency,
+
+    walletCurrency:
+      userCurrency,
+
+    conversionRate:
+      1,
+
+    balanceBeforeCredit:
+      balanceBefore,
+
+    balanceAfterCredit:
+      balanceAfter,
+
+    providerName:
+      "pawaPay",
+
+    completedAt:
+      creditedAt,
+
+    creditedAt,
+
+    updatedAt:
+      Date.now()
+  };
+
+  updates[
+    `history/${userPhone}/${historyId}`
+  ] = {
+    customID:
+      mapping.customID ||
+      `PAWAPAY-${depositId}`,
+
+    depositId,
+
+    type:
+      "pawapay_topup",
+
+    from:
+      mapping.paymentPhone ||
+      "pawaPay",
+
+    to:
+      userPhone,
+
+    provider:
+      mapping.provider ||
+      "pawaPay",
+
+    providerName:
+      "pawaPay",
+
+    amountOriginal:
+      verifiedAmount,
+
+    originalCurrency:
+      verifiedCurrency,
+
+    amountConverted:
+      creditedAmount,
+
+    walletCurrency:
+      userCurrency,
+
+    conversionRate:
+      1,
+
+    serviceFee:
+      0,
+
+    startupFee:
+      0,
+
+    totalFees:
+      0,
+
+    rateUsed:
+      "Recharge pawaPay",
+
+    reason:
+      "Recharge Mobile Money confirmée par pawaPay",
+
+    status:
+      "COMPLETED",
+
+    date:
+      new Date(
+        creditedAt
+      ).toLocaleString(
+        "fr-FR"
+      ),
+
+    createdAt:
+      creditedAt
+  };
+
+  updates[
+    `notifications/${userPhone}/${notificationId}`
+  ] = {
+    title:
+      "✅ Solde MALIPAY crédité",
+
+    phone:
+      mapping.paymentPhone ||
+      userPhone,
+
+    amount:
+      creditedAmount,
+
+    currency:
+      userCurrency,
+
+    symbol:
+      userCurrency,
+
+    originalAmount:
+      verifiedAmount,
+
+    originalCurrency:
+      verifiedCurrency,
+
+    reason:
+      "Recharge confirmée et créditée par pawaPay",
+
+    depositId,
+
+    customID:
+      mapping.customID || "",
+
+    status:
+      "COMPLETED",
+
+    balanceCredited:
+      true,
+
+    date:
+      new Date(
+        creditedAt
+      ).toLocaleString(
+        "fr-FR"
+      ),
+
+    createdAt:
+      creditedAt,
+
+    seen:
+      false,
+
+    claimable:
+      false
+  };
+
+  await adminDb
+    .ref("/")
+    .update(updates);
+
+  return {
+    credited:
+      creditedNow,
+
+    alreadyCredited:
+      alreadyCredited ||
+      (
+        !creditedNow &&
+        Boolean(
+          creditInformation
+        )
+      ),
+
+    depositId,
+
+    userPhone,
+
+    amount:
+      creditedAmount,
+
+    currency:
+      userCurrency,
+
+    newBalance:
+      balanceAfter
   };
 }
 
