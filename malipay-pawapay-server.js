@@ -682,6 +682,83 @@ function normalizeMaliPayUserPhone(value) {
   return phone;
 }
 
+/* =========================================================
+   🔎 RECHERCHE FIABLE DU COMPTE MALIPAY
+========================================================= */
+
+function getMaliPayUserKeyCandidates(value) {
+  const rawValue =
+    cleanText(value, 40)
+      .replace(/\s+/g, "");
+
+  const digitsOnly =
+    rawValue.replace(/\D/g, "");
+
+  const normalizedWithPlus =
+    normalizeMaliPayUserPhone(
+      rawValue
+    );
+
+  const candidates = [
+    rawValue,
+    normalizedWithPlus,
+    digitsOnly,
+    digitsOnly
+      ? "+" + digitsOnly
+      : ""
+  ]
+    .filter(Boolean)
+    .filter(
+      (item, index, list) =>
+        list.indexOf(item) === index
+    );
+
+  return candidates;
+}
+
+
+async function resolveMaliPayUserKey(
+  phoneValue
+) {
+  const candidates =
+    getMaliPayUserKeyCandidates(
+      phoneValue
+    );
+
+  for (const candidate of candidates) {
+    const snapshot =
+      await adminDb
+        .ref(
+          `users/${candidate}`
+        )
+        .get();
+
+    if (snapshot.exists()) {
+      return {
+        found: true,
+
+        userKey:
+          candidate,
+
+        userData:
+          snapshot.val() || {},
+
+        candidates
+      };
+    }
+  }
+
+  return {
+    found: false,
+
+    userKey: "",
+
+    userData: null,
+
+    candidates
+  };
+}
+
 function getObjectPathValue(
   root,
   pathParts
@@ -890,19 +967,61 @@ async function creditCompletedPawaPayDeposit(
     );
   }
 
-  const mapping =
+    const mapping =
     mappingSnapshot.val() || {};
 
-  const userPhone =
-    normalizeMaliPayUserPhone(
-      mapping.userPhone
+  const rawMappedUserPhone =
+    cleanText(
+      mapping.userPhone,
+      40
     );
 
-  if (!userPhone) {
+  if (!rawMappedUserPhone) {
     throw new Error(
       "Le compte MaliPay associé est invalide."
     );
   }
+
+  /*
+  Recherche du compte en essayant les différentes
+  formes possibles du numéro :
+
+  +223XXXXXXXX
+  223XXXXXXXX
+  valeur originale enregistrée
+  */
+  const resolvedUser =
+    await resolveMaliPayUserKey(
+      rawMappedUserPhone
+    );
+
+  if (!resolvedUser.found) {
+    console.error(
+      "❌ Compte MaliPay introuvable dans Firebase Admin :",
+      {
+        mappedUserPhone:
+          rawMappedUserPhone,
+
+        testedKeys:
+          resolvedUser.candidates,
+
+        databaseURL:
+          FIREBASE_DATABASE_URL
+      }
+    );
+
+    throw new Error(
+      "Le compte MaliPay est introuvable. Clés testées : " +
+      resolvedUser.candidates.join(", ")
+    );
+  }
+
+  /*
+  userPhone devient ici la véritable clé
+  retrouvée dans users/.
+  */
+  const userPhone =
+    resolvedUser.userKey;
 
   /* =====================================================
      2. VÉRIFIER LE MONTANT ET LA DEVISE
@@ -1962,7 +2081,7 @@ app.get(
         result.status ===
           "FAILED";
 
-      return res.status(200).json({
+            return res.status(200).json({
         ok: true,
 
         found:
@@ -1990,6 +2109,22 @@ app.get(
         alreadyCredited:
           result.alreadyCredited ===
             true,
+
+        creditedAmount:
+          Number(
+            result.amount || 0
+          ),
+
+        creditedCurrency:
+          result.currency || "",
+
+        newBalance:
+          result.newBalance !== undefined
+            ? Number(result.newBalance)
+            : null,
+
+        userPhone:
+          result.userPhone || "",
 
         data:
           result.data ||
