@@ -686,13 +686,19 @@ function normalizeMaliPayUserPhone(value) {
    🔎 RECHERCHE FIABLE DU COMPTE MALIPAY
 ========================================================= */
 
+function getPhoneDigits(value) {
+  return String(value || "")
+    .replace(/\D/g, "");
+}
+
+
 function getMaliPayUserKeyCandidates(value) {
   const rawValue =
     cleanText(value, 40)
       .replace(/\s+/g, "");
 
   const digitsOnly =
-    rawValue.replace(/\D/g, "");
+    getPhoneDigits(rawValue);
 
   const normalizedWithPlus =
     normalizeMaliPayUserPhone(
@@ -701,16 +707,29 @@ function getMaliPayUserKeyCandidates(value) {
 
   const candidates = [
     rawValue,
+
     normalizedWithPlus,
+
     digitsOnly,
+
     digitsOnly
       ? "+" + digitsOnly
+      : "",
+
+    /*
+    Numéro national sans indicatif malien.
+    Exemple :
+    22374816685 devient 74816685.
+    */
+    digitsOnly.startsWith("223") &&
+    digitsOnly.length > 8
+      ? digitsOnly.slice(3)
       : ""
   ]
     .filter(Boolean)
     .filter(
-      (item, index, list) =>
-        list.indexOf(item) === index
+      (candidate, index, list) =>
+        list.indexOf(candidate) === index
     );
 
   return candidates;
@@ -720,11 +739,26 @@ function getMaliPayUserKeyCandidates(value) {
 async function resolveMaliPayUserKey(
   phoneValue
 ) {
+  const searchedDigits =
+    getPhoneDigits(
+      phoneValue
+    );
+
+  const searchedNationalDigits =
+    searchedDigits.startsWith("223") &&
+    searchedDigits.length > 8
+      ? searchedDigits.slice(3)
+      : searchedDigits;
+
   const candidates =
     getMaliPayUserKeyCandidates(
       phoneValue
     );
 
+  /*
+  1. Recherche directe avec toutes les formes
+  raisonnables de la clé Firebase.
+  */
   for (const candidate of candidates) {
     const snapshot =
       await adminDb
@@ -743,8 +777,96 @@ async function resolveMaliPayUserKey(
         userData:
           snapshot.val() || {},
 
+        matchType:
+          "direct_key",
+
         candidates
       };
+    }
+  }
+
+  /*
+  2. Recherche de secours dans users/.
+
+  Elle compare :
+  - les chiffres de la clé Firebase ;
+  - le champ phone enregistré dans l’utilisateur ;
+  - le numéro avec indicatif ;
+  - le numéro national sans indicatif.
+  */
+  const usersSnapshot =
+    await adminDb
+      .ref("users")
+      .get();
+
+  if (usersSnapshot.exists()) {
+    const users =
+      usersSnapshot.val() || {};
+
+    for (
+      const [userKey, userData]
+      of Object.entries(users)
+    ) {
+      const keyDigits =
+        getPhoneDigits(
+          userKey
+        );
+
+      const storedPhoneDigits =
+        getPhoneDigits(
+          userData?.phone || ""
+        );
+
+      const keyNationalDigits =
+        keyDigits.startsWith("223") &&
+        keyDigits.length > 8
+          ? keyDigits.slice(3)
+          : keyDigits;
+
+      const storedNationalDigits =
+        storedPhoneDigits.startsWith("223") &&
+        storedPhoneDigits.length > 8
+          ? storedPhoneDigits.slice(3)
+          : storedPhoneDigits;
+
+      const matches =
+        Boolean(searchedDigits) &&
+        (
+          keyDigits === searchedDigits ||
+
+          storedPhoneDigits ===
+            searchedDigits ||
+
+          keyNationalDigits ===
+            searchedNationalDigits ||
+
+          storedNationalDigits ===
+            searchedNationalDigits
+        );
+
+      if (matches) {
+        return {
+          found: true,
+
+          userKey,
+
+          userData:
+            userData || {},
+
+          matchType:
+            keyDigits === searchedDigits
+              ? "key_digits"
+              : storedPhoneDigits ===
+                  searchedDigits
+              ? "stored_phone"
+              : keyNationalDigits ===
+                  searchedNationalDigits
+              ? "national_key"
+              : "national_stored_phone",
+
+          candidates
+        };
+      }
     }
   }
 
@@ -754,6 +876,9 @@ async function resolveMaliPayUserKey(
     userKey: "",
 
     userData: null,
+
+    matchType:
+      "not_found",
 
     candidates
   };
@@ -1022,6 +1147,23 @@ async function creditCompletedPawaPayDeposit(
   */
   const userPhone =
     resolvedUser.userKey;
+
+      console.log(
+    "✅ Compte MaliPay retrouvé pour le crédit pawaPay :",
+    {
+      depositId,
+
+      mappedUserPhone:
+        rawMappedUserPhone,
+
+      resolvedUserKey:
+        userPhone,
+
+      matchType:
+        resolvedUser.matchType ||
+        "direct_key"
+    }
+  );
 
   /* =====================================================
      2. VÉRIFIER LE MONTANT ET LA DEVISE
@@ -1756,15 +1898,13 @@ app.post(
           req.body?.customerMessage
         );
 
-      const userPhone =
-        normalizeMaliPayUserPhone(
-          req.body?.userPhone
+            const requestedUserPhone =
+        cleanText(
+          req.body?.userPhone,
+          40
         );
 
-      if (
-        !userPhone ||
-        userPhone.length < 8
-      ) {
+      if (!requestedUserPhone) {
         return res.status(400).json({
           ok: false,
 
@@ -1772,6 +1912,63 @@ app.post(
             "Le compte MaliPay associé à la recharge est invalide."
         });
       }
+
+      /*
+      Retrouver la véritable clé Firebase avant
+      de créer la recharge pawaPay.
+
+      Ainsi, pawaPayDeposits/{depositId}/userPhone
+      contiendra toujours la clé réelle de users/.
+      */
+      const resolvedMaliPayUser =
+        await resolveMaliPayUserKey(
+          requestedUserPhone
+        );
+
+      if (!resolvedMaliPayUser.found) {
+        console.error(
+          "❌ Création Deposit refusée : compte MaliPay introuvable.",
+          {
+            requestedUserPhone,
+
+            testedKeys:
+              resolvedMaliPayUser.candidates,
+
+            databaseURL:
+              FIREBASE_DATABASE_URL
+          }
+        );
+
+        return res.status(404).json({
+          ok: false,
+
+          accepted: false,
+
+          final: false,
+
+          error:
+            "Le compte MaliPay associé à cette recharge est introuvable."
+        });
+      }
+
+      /*
+      userPhone est désormais la clé exacte
+      présente sous users/ dans Firebase.
+      */
+      const userPhone =
+        resolvedMaliPayUser.userKey;
+
+      console.log(
+        "✅ Compte MaliPay identifié avant Deposit :",
+        {
+          requestedUserPhone,
+
+          userPhone,
+
+          matchType:
+            resolvedMaliPayUser.matchType
+        }
+      );
 
       if (!provider) {
         return res.status(400).json({
